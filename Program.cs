@@ -39,6 +39,26 @@ internal static class SelfTest
 
         try
         {
+            var table = ConnectionTable.Read();
+            L($"Connection table (no admin needed): {table.Count} entries — " +
+              string.Join(", ", table.GroupBy(t => t.Proto + " " + (t.LocalIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? "v6" : "v4"))
+                  .Select(g => $"{g.Key}: {g.Count()}")));
+            foreach (var t in table.Where(t => t.State == "Established").OrderBy(t => t.Pid).Take(15))
+                L($"  {ProcessNames.Get(t.Pid),-22} pid {t.Pid,-6} {t.Proto} {Fmt.Endpoint(t.LocalIp, t.LocalPort),-26} -> {Fmt.Endpoint(t.RemoteIp!, t.RemotePort),-30} {t.State}");
+            var adapters = new AdapterCounter();
+            adapters.Sample();
+            Thread.Sleep(2000);
+            var (up, down) = adapters.Sample();
+            L($"Adapter totals over 2 s: up {Fmt.Rate(up)}, down {Fmt.Rate(down)}");
+        }
+        catch (Exception ex)
+        {
+            L("CONNECTION TABLE ERROR: " + ex);
+        }
+        L("");
+
+        try
+        {
             using var mon = new NetworkMonitor();
             mon.Start();
             L("ETW session started.");

@@ -91,7 +91,7 @@ internal sealed class QosPolicy
     }
 }
 
-internal sealed record PolicyListResult(List<QosPolicy> Policies, List<string> Errors, string Raw, string Stderr);
+internal sealed record PolicyListResult(List<QosPolicy> Policies, List<string> Errors, string Raw, string Stderr, bool ActiveStoreReadable = true);
 
 /// <summary>Talks to the NetQos PowerShell cmdlets. User input is always passed as base64 JSON, never spliced into script text.</summary>
 internal static class QosService
@@ -214,6 +214,10 @@ try { $all += @(Get-NetQosPolicy | ForEach-Object { Convert-Policy $_ 'Persisten
             }
         }
 
+        // Without admin the temporary store can't be read; that's expected, not an error worth showing.
+        bool activeReadable = !errors.Any(e => e.StartsWith("ActiveStore", StringComparison.Ordinal));
+        if (!activeReadable) errors.RemoveAll(e => e.StartsWith("ActiveStore", StringComparison.Ordinal));
+
         var merged = new List<QosPolicy>();
         foreach (var g in raw.GroupBy(x => (x.P.Name, x.P.Owner)))
         {
@@ -222,7 +226,7 @@ try { $all += @(Get-NetQosPolicy | ForEach-Object { Convert-Policy $_ 'Persisten
             var src = g.FirstOrDefault(x => x.Store == "Active").P ?? g.First().P;
             bool gpo = src.Owner.StartsWith("Group Policy", StringComparison.OrdinalIgnoreCase);
             string lifetime = gpo ? "Group Policy"
-                : persistent ? (active ? "Permanent" : "Permanent (not active)")
+                : persistent ? (active || !activeReadable ? "Permanent" : "Permanent (not active)")
                 : "Until reboot";
             merged.Add(new QosPolicy
             {
@@ -235,7 +239,7 @@ try { $all += @(Get-NetQosPolicy | ForEach-Object { Convert-Policy $_ 'Persisten
         }
 
         return new PolicyListResult(merged.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase).ToList(),
-            errors, r.Stdout.Trim(), r.Stderr.Trim());
+            errors, r.Stdout.Trim(), r.Stderr.Trim(), activeReadable);
     }
 
     public static async Task<(bool Ok, string Error)> CreateAsync(PolicyRequest req)

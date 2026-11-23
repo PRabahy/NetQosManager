@@ -35,7 +35,11 @@ internal sealed class MainForm : Form
     private readonly HashSet<int> _expanded = new();
 
     // Column indexes.
-    private const int TProcess = 0, TPid = 1, TProto = 2, TLocal = 3, TRemote = 4, TUp = 5, TDown = 6, TSent = 7, TRecv = 8;
+    private const int TProcess = 0, TPid = 1, TProto = 2, TLocal = 3, TRemote = 4, TUp = 5, TDown = 6, TSent = 7, TRecv = 8, TState = 9;
+
+    // Without admin: connection table + adapter totals instead of ETW.
+    private readonly AdapterCounter _adapters = new();
+    private bool LimitedMode => _monitor == null;
     private const int PName = 0, PLifetime = 1, PMatch = 2, PLimit = 3, PCurrent = 4, POwner = 5;
 
     private readonly SortState _trafficSort;
@@ -59,6 +63,7 @@ internal sealed class MainForm : Form
         _traffic.Columns.Add("Download", 100, HorizontalAlignment.Right);
         _traffic.Columns.Add("Sent", 90, HorizontalAlignment.Right);
         _traffic.Columns.Add("Received", 90, HorizontalAlignment.Right);
+        _traffic.Columns.Add("State", 95);
 
         _policies.Columns.Add("Name", 200);
         _policies.Columns.Add("Lifetime", 150);
@@ -157,9 +162,13 @@ internal sealed class MainForm : Form
 
         if (!Admin.IsElevated)
         {
-            ShowBanner("Not running as administrator. Measuring traffic and changing QoS policies both need admin rights.", true);
-            _throttle.Enabled = _delete.Enabled = _deleteAll.Enabled = _refresh.Enabled = false;
-            _status.Text = "Read-only: restart as administrator.";
+            ShowBanner("Limited view: without admin rights you see connections and total speed, but not per-connection " +
+                       "speeds or temporary policies, and can't change anything.", true);
+            _throttle.Enabled = _delete.Enabled = _deleteAll.Enabled = false;
+            _hideIdle.Text = "Hide listening / closed";
+            _timer.Start();
+            OnTick();
+            await RefreshPoliciesAsync();
             return;
         }
 
@@ -174,7 +183,9 @@ internal sealed class MainForm : Form
         {
             _monitor?.Dispose();
             _monitor = null;
-            ShowBanner("Traffic measurement could not start: " + ex.Message, false);
+            ShowBanner("Per-connection speeds unavailable (" + ex.Message + "). Showing connections and total speed only.", false);
+            _hideIdle.Text = "Hide listening / closed";
+            _timer.Start();
         }
 
         await RefreshPoliciesAsync();
@@ -195,11 +206,17 @@ internal sealed class MainForm : Form
 
     private void OnTick()
     {
-        if (_monitor == null) return;
+        if (_monitor == null)
+        {
+            OnTickLimited();
+            return;
+        }
         if (_monitor.ConsumerExited)
         {
-            _timer.Stop();
-            ShowBanner($"Traffic measurement stopped unexpectedly (ProcessTrace status {_monitor.ProcessTraceStatus}).", false);
+            ShowBanner($"Per-connection speeds stopped (ProcessTrace status {_monitor.ProcessTraceStatus}). Showing connections and total speed only.", false);
+            _monitor.Dispose();
+            _monitor = null;
+            _hideIdle.Text = "Hide listening / closed";
             return;
         }
 
@@ -246,11 +263,76 @@ internal sealed class MainForm : Form
         foreach (var kv in seen) _prev[kv.Key] = kv.Value;
         _monitor.Prune(120_000);
 
+        // Add TCP state from the connection table.
+        try
+        {
+            var states = new Dictionary<string, string>();
+            foreach (var t in ConnectionTable.Read())
+                if (t.RemoteIp != null)
+                    states[$"{t.Pid}|{t.Proto}|{Fmt.Endpoint(t.LocalIp, t.LocalPort)}|{Fmt.Endpoint(t.RemoteIp, t.RemotePort)}"] = t.State;
+            foreach (var r in rows)
+                if (states.TryGetValue(r.Key, out var st)) r.State = st;
+        }
+        catch (Exception)
+        {
+            // state is cosmetic
+        }
+
         _connRows = rows;
         _totals.Text = $"Total  ↑ {Fmt.Rate(rows.Sum(r => r.UpBytesPerSec)),-12}  ↓ {Fmt.Rate(rows.Sum(r => r.DownBytesPerSec))}";
         if (!_menuOpen) RenderTraffic(); // don't reshuffle rows under an open right-click menu
         UpdatePolicyRates();
     }
+
+    /// <summary>No admin: list connections from the TCP/UDP tables, total speed from the adapters.</summary>
+    private void OnTickLimited()
+    {
+        long now = Environment.TickCount64;
+        List<TableEntry> table;
+        try
+        {
+            table = ConnectionTable.Read();
+        }
+        catch (Exception ex)
+        {
+            _status.Text = "Couldn't read the connection table: " + ex.Message;
+            return;
+        }
+
+        var rows = new List<TrafficRow>(table.Count);
+        var keys = new HashSet<string>();
+        foreach (var t in table)
+        {
+            string local = Fmt.Endpoint(t.LocalIp, t.LocalPort);
+            string remote = t.RemoteIp == null ? "*:*" : Fmt.Endpoint(t.RemoteIp, t.RemotePort);
+            string key = $"{t.Pid}|{t.Proto}|{local}|{remote}";
+            if (!keys.Add(key)) continue;
+            rows.Add(new TrafficRow
+            {
+                Key = key,
+                Pid = t.Pid,
+                Process = ProcessNames.Get(t.Pid),
+                Proto = t.Proto,
+                Local = local,
+                Remote = remote,
+                LocalIp = t.LocalIp,
+                LocalPort = t.LocalPort,
+                RemoteIp = t.RemoteIp,
+                RemotePort = t.RemotePort,
+                State = t.Proto == "UDP" ? "Open" : t.State,
+                LastSeen = now,
+            });
+        }
+        _connRows = rows;
+
+        var (up, down) = _adapters.Sample();
+        _totals.Text = $"Adapters  ↑ {Fmt.Rate(up),-12}  ↓ {Fmt.Rate(down)}";
+        if (!_menuOpen) RenderTraffic();
+    }
+
+    /// <summary>In limited mode "idle" means not an active TCP connection.</summary>
+    private static bool IsActiveConnection(TrafficRow r) =>
+        r.Proto == "TCP" && r.State is not ("Listening" or "Time wait" or "Closed" or "Delete TCB" or "");
 
     private static int ByActivity(TrafficRow a, TrafficRow b)
     {
@@ -273,9 +355,11 @@ internal sealed class MainForm : Form
             TDown => a.DownBytesPerSec.CompareTo(b.DownBytesPerSec),
             TSent => a.Sent.CompareTo(b.Sent),
             TRecv => a.Recv.CompareTo(b.Recv),
+            TState => string.Compare(a.State, b.State, StringComparison.OrdinalIgnoreCase),
             _ => 0,
         };
         if (_trafficSort.Column >= 0) c = _trafficSort.Apply(c);
+        if (c == 0 && LimitedMode) c = string.Compare(a.Process, b.Process, StringComparison.OrdinalIgnoreCase); // no rates to rank by
         if (c == 0) c = ByActivity(a, b);
         return c != 0 ? c : string.CompareOrdinal(a.Key, b.Key); // stable order, no jitter between refreshes
     }
@@ -284,7 +368,7 @@ internal sealed class MainForm : Form
         new(new[]
         {
             showProcess ? r.Process : "", showProcess ? r.Pid.ToString() : "", r.Proto, r.Local, r.Remote,
-            Fmt.Rate(r.UpBytesPerSec), Fmt.Rate(r.DownBytesPerSec), Fmt.Bytes(r.Sent), Fmt.Bytes(r.Recv),
+            Fmt.Rate(r.UpBytesPerSec), Fmt.Rate(r.DownBytesPerSec), Fmt.Bytes(r.Sent), Fmt.Bytes(r.Recv), r.State,
         }, image)
         { Name = r.Key, Tag = r, IndentCount = indent };
 
@@ -305,7 +389,8 @@ internal sealed class MainForm : Form
     {
         long now = Environment.TickCount64;
         IEnumerable<TrafficRow> conns = _connRows;
-        if (_hideIdle.Checked) conns = conns.Where(r => now - r.LastSeen <= 10_000);
+        if (_hideIdle.Checked)
+            conns = LimitedMode ? conns.Where(IsActiveConnection) : conns.Where(r => now - r.LastSeen <= 10_000);
         var connList = conns.ToList();
         connList.Sort(CompareTraffic);
 
@@ -534,7 +619,7 @@ internal sealed class MainForm : Form
             deleteAll.Enabled = admin && _policyList.Any(p => p.Removable);
             copyPs.Enabled = sel.Count > 0;
             copyPs.Text = sel.Count > 1 ? $"Copy {sel.Count} as PowerShell commands" : "Copy as PowerShell command";
-            refresh.Enabled = admin;
+            refresh.Enabled = !_busy;
         };
 
         change.Click += async (_, _) => await ChangeLimitAsync();
@@ -559,7 +644,8 @@ internal sealed class MainForm : Form
     {
         _busy = busy;
         bool enable = !busy && Admin.IsElevated;
-        _throttle.Enabled = _delete.Enabled = _deleteAll.Enabled = _refresh.Enabled = enable;
+        _throttle.Enabled = _delete.Enabled = _deleteAll.Enabled = enable;
+        _refresh.Enabled = !busy;
         UseWaitCursor = busy;
         if (message != null) _status.Text = message;
     }
@@ -574,6 +660,7 @@ internal sealed class MainForm : Form
             _policyList = result.Policies;
             FillPolicies();
             string summary = $"{_policyList.Count} QoS polic{(_policyList.Count == 1 ? "y" : "ies")}";
+            if (!result.ActiveStoreReadable) summary += " shown (temporary policies are only visible as administrator)";
             if (result.Errors.Count > 0) summary += " — errors: " + string.Join(" | ", result.Errors);
             _status.Text = afterMessage != null ? afterMessage + "   (" + summary + ")" : summary;
         }

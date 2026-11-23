@@ -19,8 +19,18 @@ throttle uploads with Windows Policy-based QoS, without typing `New-NetQosPolicy
 
 - Windows 10/11, 64-bit
 - [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (the .NET 8 SDK to build)
-- Administrator rights for measuring traffic and changing policies. The app starts unelevated and offers
-  **Restart as administrator**.
+- Administrator rights for per-connection speeds and for changing policies. The app starts unelevated and
+  offers **Restart as administrator**.
+
+### Without administrator rights (limited view)
+
+| Works | Needs admin |
+|---|---|
+| Every TCP/UDP connection with its owning process, addresses and TCP state | Per-connection upload/download speeds and byte totals |
+| Total upload/download speed of the network adapters | Temporary (until reboot) QoS policies |
+| Permanent QoS policies (read-only), sorting, tree view, copy, open file location | Creating, changing or deleting policies |
+
+In the limited view, **Hide listening / closed** shows only active TCP connections.
 
 ## Build and run
 
@@ -43,7 +53,8 @@ elevated prompt:
 - **Traffic:** a real-time ETW session on the `Microsoft-Windows-Kernel-Network` provider (TCP/UDP send and
   receive events, IPv4 and IPv6). Bytes are counted per process and connection. Which side is local is
   decided by comparing against the machine's own addresses, and port byte order is detected automatically
-  against the TCP table.
+  against the TCP table. TCP state and the limited view come from `GetExtendedTcpTable` /
+  `GetExtendedUdpTable`, which don't need admin. Adapter totals come from the interface statistics.
 - **Policies:** the app runs the built-in NetQos PowerShell cmdlets (`Get-`, `New-`, `Set-` and
   `Remove-NetQosPolicy`). User input is passed as base64-encoded JSON, never spliced into script text.
 

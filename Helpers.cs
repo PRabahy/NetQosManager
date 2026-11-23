@@ -20,6 +20,7 @@ internal sealed class TrafficRow
     public IPAddress? RemoteIp;
     public int RemotePort;
     public int Connections = 1;
+    public string State = "";
     public double UpBytesPerSec;
     public double DownBytesPerSec;
     public long Sent;
