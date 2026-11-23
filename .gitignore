@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+*.user
+
+# Local diagnostic output (contains machine/network details)
+activestore.txt
+qos-test*.txt
+selftest*.txt
